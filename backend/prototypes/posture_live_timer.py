@@ -1,3 +1,18 @@
+"""
+StudyWise Live Posture Prototype
+
+Install:
+    pip install opencv-python mediapipe numpy
+
+Run:
+    python backend/prototypes/posture_live_timer.py
+
+Controls:
+    q -> quit
+    r -> reset focus timer
+    c -> calibrate (collect ~3s upright posture)
+"""
+
 import sys
 import time
 from collections import deque
