@@ -1,23 +1,24 @@
 """
-StudyWise Live Posture + Focus Prototype (model-based)
+StudyWise Live Posture Prototype
+
+Install:
+    pip install opencv-python mediapipe numpy
 
 Run:
     python backend/prototypes/posture_live_timer.py
 
 Controls:
     q -> quit
-    r -> reset focused timer
-    c -> calibrate (for angles, still used for debugging if needed)
+    r -> reset focus timer
+    c -> calibrate (collect ~3s upright posture)
 """
 
-import os
 import sys
 import time
 from collections import deque
 from typing import Deque, Iterable, Optional, Tuple
 
 import cv2
-import joblib
 import numpy as np
 
 try:
@@ -26,8 +27,15 @@ except Exception:
     print("ERROR: Failed to import mediapipe. Install with: pip install mediapipe", file=sys.stderr)
     sys.exit(1)
 
+
+
+
 ROLLING_WINDOW_FRAMES = 15
-VISIBILITY_THRESHOLD = 0.5
+
+NEUTRAL_NECK_MAX = 10.0
+NEUTRAL_EARSHOULDER_MAX = 30.0
+SEVERE_NECK_MIN = 20.0
+SEVERE_EARSHOULDER_MIN = 25.0
 
 COLOR_GREEN = (0, 200, 0)
 COLOR_YELLOW = (0, 215, 255)
@@ -35,19 +43,29 @@ COLOR_RED = (0, 0, 255)
 COLOR_GRAY = (160, 160, 160)
 COLOR_WHITE = (255, 255, 255)
 
-STATE_STABLE_SECONDS = 1.0 
+VISIBILITY_THRESHOLD = 0.5
+
 
 
 def angle_to_vertical(p1: Tuple[int, int], p2: Tuple[int, int]) -> float:
+    """Return acute angle (0..90°) between vector p1->p2 and the vertical axis.
+
+    Image coords: origin (0,0) top-left; x right is +; y down is +.
+    Treat vertical 'up' as vector (0, -1). For vector v = (dx, dy), angle to vertical is
+    atan2(dx, -dy). We then take absolute degrees and fold obtuse to acute.
+
+    Expected upright: ≈ 0–8° neck tilt, ≈ 0–12° ear–shoulder.
+    """
     dx = float(p2[0] - p1[0])
-    dy = float(p2[1] - p1[1])
-    ang = abs(np.degrees(np.arctan2(dx, -dy)))
+    dy = float(p2[1] - p1[1])  # positive is down
+    ang = abs(np.degrees(np.arctan2(dx, -dy)))  # 0 when perfectly vertical up
     if ang > 90.0:
         ang = 180.0 - ang
     return float(ang)
 
 
 def rotate_point(p: Tuple[int, int], center: Tuple[int, int], deg: float) -> Tuple[int, int]:
+    """Rotate point p around center by deg degrees (image coords)."""
     th = np.radians(deg)
     cos, sin = float(np.cos(th)), float(np.sin(th))
     x, y = float(p[0] - center[0]), float(p[1] - center[1])
@@ -57,6 +75,11 @@ def rotate_point(p: Tuple[int, int], center: Tuple[int, int], deg: float) -> Tup
 
 
 def get_landmark_xy(landmarks, idx: int, width: int, height: int) -> Optional[Tuple[int, int, float]]:
+    """Return (x_px, y_px, visibility) for a landmark if confidently visible, else None.
+
+    px = int(lm.x * frame_width); py = int(lm.y * frame_height). y increases downward.
+    Only accept landmarks with visibility >= 0.5.
+    """
     lm = landmarks[idx]
     if lm.visibility is None or lm.visibility < VISIBILITY_THRESHOLD:
         return None
@@ -74,7 +97,21 @@ def median_ignore_none(values: Iterable[Optional[float]]) -> Optional[float]:
     return float(np.median(np.array(arr, dtype=np.float32)))
 
 
+def classify_posture(present: bool, neck_deg: Optional[float], ear_deg: Optional[float]) -> str:
+    if not present:
+        return "away"
+    # missing values handling; neck primary, ear supporting
+    n = neck_deg if neck_deg is not None else 999.0
+    e = ear_deg if ear_deg is not None else 999.0
+    if n <= NEUTRAL_NECK_MAX and e <= (NEUTRAL_EARSHOULDER_MAX + 5.0):
+        return "neutral"
+    if n >= SEVERE_NECK_MIN or e >= SEVERE_EARSHOULDER_MIN:
+        return "lean"
+    return "slouch"
+
+
 def draw_status_pill(img: np.ndarray, label: str, color: Tuple[int, int, int]) -> None:
+    """Draw a rounded status pill with text in the top-right corner."""
     h, w = img.shape[:2]
     margin_x, margin_y = 10, 10
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -91,76 +128,47 @@ def draw_status_pill(img: np.ndarray, label: str, color: Tuple[int, int, int]) -
     y2 = y1 + pill_h
     radius = pill_h // 2
 
+    # Central rectangles
     cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1)
     cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1)
+    # Circles at corners
     cv2.circle(img, (x1 + radius, y1 + radius), radius, color, -1)
     cv2.circle(img, (x2 - radius, y1 + radius), radius, color, -1)
     cv2.circle(img, (x1 + radius, y2 - radius), radius, color, -1)
     cv2.circle(img, (x2 - radius, y2 - radius), radius, color, -1)
 
+    # Text
     text_x = x1 + pad_x
     text_y = y1 + pad_y + text_h
     cv2.putText(img, label, (text_x, text_y), font, font_scale, COLOR_WHITE, thickness, cv2.LINE_AA)
 
 
-def compute_engaged_score(present: bool, posture_state: str) -> float:
-    if not present:
-        return 0.0
-    if posture_state == "neutral":
-        return 1.0
-    if posture_state == "slouch":
-        return 0.6
-    if posture_state == "lean":
-        return 0.3
-    return 0.0
-
-
-def state_color(state: str) -> Tuple[int, int, int]:
-    if state == "neutral":
-        return COLOR_GREEN
-    if state == "slouch":
-        return COLOR_YELLOW
-    if state == "lean":
-        return COLOR_RED
-    return COLOR_GRAY
-
-
 def main() -> int:
-    # Load posture model
-    model_path = os.path.join("backend", "models", "posture_model.joblib")
-    if not os.path.exists(model_path):
-        print(f"ERROR: posture model not found at {model_path}", file=sys.stderr)
-        print("Run backend/train_posture_model.py first.", file=sys.stderr)
-        return 1
-
-    POSTURE_MODEL = joblib.load(model_path)
-    POSTURE_CLASSES = POSTURE_MODEL.classes_
-
+    # Open default webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("ERROR: Could not open webcam.", file=sys.stderr)
+        print("Please check that:", file=sys.stderr)
+        print("  - A webcam is connected", file=sys.stderr)
+        print("  - No other application is using it", file=sys.stderr)
+        print("  - Camera permissions are granted", file=sys.stderr)
         return 1
 
+    # Target 1280x720 if supported
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Webcam opened at {actual_width}x{actual_height}")
-    print("Press 'q' to quit, 'r' to reset focused timer")
+    print("Press 'q' to quit, 'r' to reset focus timer")
 
+    # Rolling windows for smoothing (store per-frame values; ignore None in median)
     neck_window: Deque[Optional[float]] = deque(maxlen=ROLLING_WINDOW_FRAMES)
     ear_window: Deque[Optional[float]] = deque(maxlen=ROLLING_WINDOW_FRAMES)
 
-    session_seconds = 0.0
-    focused_seconds = 0.0
+    # Focus timer state
+    focus_seconds = 0.0
     last_time = time.time()
-
-    # state smoothing
-    smooth_state = "away"
-    smooth_conf = 0.0
-    cand_state: Optional[str] = None
-    cand_conf: float = 0.0
-    cand_duration: float = 0.0
 
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
@@ -170,27 +178,19 @@ def main() -> int:
         min_tracking_confidence=0.5,
     )
 
-    # calibration vars (kept but not strictly needed for the model)
-    calibrating = False
-    calib_present_elapsed = 0.0
-    calib_neck_vals: Deque[float] = deque()
-    calib_ear_vals: Deque[float] = deque()
-    calibrate_msg_until = 0.0
-    calibrate_msg_text = ""
-
     try:
         while True:
             ret, frame_bgr = cap.read()
             if not ret:
-                print("ERROR: Failed to read frame.", file=sys.stderr)
+                print("ERROR: Failed to read frame from webcam.", file=sys.stderr)
                 break
 
+            # Time delta for focus timer
             now = time.time()
             dt = now - last_time
             last_time = now
 
-            session_seconds += dt
-
+            # Process pose
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             frame_rgb.flags.writeable = False
             results = pose.process(frame_rgb)
@@ -202,16 +202,17 @@ def main() -> int:
             present = False
             neck_deg_frame: Optional[float] = None
             ear_deg_frame: Optional[float] = None
-            shoulder_y: Optional[float] = None
 
             if results.pose_landmarks:
                 lms = results.pose_landmarks.landmark
                 PL = mp_pose.PoseLandmark
 
+                # Shoulders determine presence
                 ls = get_landmark_xy(lms, PL.LEFT_SHOULDER.value, w, h)
                 rs = get_landmark_xy(lms, PL.RIGHT_SHOULDER.value, w, h)
                 nose = get_landmark_xy(lms, PL.NOSE.value, w, h)
 
+                # Ears with fallback to eye-outer if ear occluded
                 le = get_landmark_xy(lms, PL.LEFT_EAR.value, w, h)
                 if le is None:
                     le = get_landmark_xy(lms, PL.LEFT_EYE_OUTER.value, w, h)
@@ -220,7 +221,6 @@ def main() -> int:
                     re = get_landmark_xy(lms, PL.RIGHT_EYE_OUTER.value, w, h)
 
                 has_head = (nose is not None) or (le is not None) or (re is not None)
-
                 if ls is not None and rs is not None and has_head:
                     present = True
 
@@ -231,11 +231,9 @@ def main() -> int:
                         int(0.5 * (ls_xy[1] + rs_xy[1])),
                     )
 
-                    roll_deg = float(
-                        np.degrees(
-                            np.arctan2(rs_xy[1] - ls_xy[1], rs_xy[0] - ls_xy[0])
-                        )
-                    )
+                    # Roll compensation: rotate points around mid-shoulder so shoulder line becomes horizontal
+                    # roll_deg: angle of L->R shoulder vs. horizontal
+                    roll_deg = float(np.degrees(np.arctan2(rs_xy[1] - ls_xy[1], rs_xy[0] - ls_xy[0])))
 
                     nose_xy = (int(nose[0]), int(nose[1])) if nose is not None else None
                     le_xy = (int(le[0]), int(le[1])) if le is not None else None
@@ -247,113 +245,82 @@ def main() -> int:
                     le_n = rotate_point(le_xy, mid_shoulder, -roll_deg) if le_xy else None
                     re_n = rotate_point(re_xy, mid_shoulder, -roll_deg) if re_xy else None
 
+                    # Neck tilt (angles are roll-normalized)
                     if nose_n is not None:
                         neck_deg_frame = angle_to_vertical(mid_shoulder, nose_n)
-                        cv2.line(frame, mid_shoulder, nose_xy, (0, 255, 255), 2)
+                        # Draw vectors on original frame for visual sanity
+                        cv2.line(frame, (mid_shoulder[0], mid_shoulder[1]), (nose_xy[0], nose_xy[1]), (0, 255, 255), 2)
 
+                    # Ear–shoulder per side (roll-normalized angles)
                     side_vals = []
                     if le_n is not None:
                         side_vals.append(angle_to_vertical(ls_n, le_n))
-                        cv2.line(frame, ls_xy, le_xy, (255, 255, 0), 2)
+                        cv2.line(frame, (ls_xy[0], ls_xy[1]), (le_xy[0], le_xy[1]), (255, 255, 0), 2)
                     if re_n is not None:
                         side_vals.append(angle_to_vertical(rs_n, re_n))
-                        cv2.line(frame, rs_xy, re_xy, (255, 255, 0), 2)
+                        cv2.line(frame, (rs_xy[0], rs_xy[1]), (re_xy[0], re_xy[1]), (255, 255, 0), 2)
                     if side_vals:
                         ear_deg_frame = float(np.mean(side_vals))
 
-                    # average shoulder y
-                    shoulder_y = 0.5 * (ls_xy[1] + rs_xy[1])
-
-                    # draw keypoints
+                    # Draw keypoints (original coords)
                     for pt in [nose, le, re, ls, rs]:
                         if pt is not None:
                             cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (0, 255, 0), -1)
 
-            # update smoothing windows
+            # Update smoothing windows
             neck_window.append(neck_deg_frame)
             ear_window.append(ear_deg_frame)
             neck_deg_med = median_ignore_none(neck_window)
             ear_deg_med = median_ignore_none(ear_window)
 
-            # model inference
-            raw_state = "away"
-            raw_conf = 0.0
-            if (
-                present
-                and neck_deg_med is not None
-                and ear_deg_med is not None
-                and shoulder_y is not None
-            ):
-                feat = [[float(neck_deg_med), float(ear_deg_med), float(shoulder_y)]]
-                probs = POSTURE_MODEL.predict_proba(feat)[0]
-                idx = int(np.argmax(probs))
-                raw_state = str(POSTURE_CLASSES[idx])
-                raw_conf = float(probs[idx])
+            # Update focus timer (counts only while present)
+            if present:
+                focus_seconds += dt
 
-            # state smoothing (to avoid flicker)
-            if raw_state == smooth_state:
-                cand_state = None
-                cand_conf = 0.0
-                cand_duration = 0.0
-            else:
-                if cand_state == raw_state:
-                    cand_duration += dt
-                    cand_conf = raw_conf
-                    if cand_duration >= STATE_STABLE_SECONDS:
-                        smooth_state = raw_state
-                        smooth_conf = cand_conf
-                        cand_state = None
-                        cand_conf = 0.0
-                        cand_duration = 0.0
-                else:
-                    cand_state = raw_state
-                    cand_conf = raw_conf
-                    cand_duration = 0.0
+            # Classification
+            state = classify_posture(present, neck_deg_med, ear_deg_med)
+            color = {
+                "neutral": COLOR_GREEN,
+                "slouch": COLOR_YELLOW,
+                "lean": COLOR_RED,
+                "away": COLOR_GRAY,
+            }[state]
 
-            # engaged score + focused timer
-            engaged_score = compute_engaged_score(present, smooth_state)
-            if engaged_score >= 0.5:
-                focused_seconds += dt
-
-            # text overlays
+            # Top-left overlay text
             y0 = 30
             dy = 28
             txt_present = f"present: {'yes' if present else 'no'}"
-            txt_neck = f"neck_deg: {neck_deg_med:.1f}" if neck_deg_med is not None else "neck_deg: --"
-            txt_ear = f"ear_deg: {ear_deg_med:.1f}" if ear_deg_med is not None else "ear_deg: --"
-            txt_sh = f"shoulder_y: {shoulder_y:.1f}" if shoulder_y is not None else "shoulder_y: --"
+            txt_neck = f"neck_tilt_deg: {neck_deg_med:.1f}" if neck_deg_med is not None else "neck_tilt_deg: --"
+            txt_ear = f"ear_shoulder_deg: {ear_deg_med:.1f}" if ear_deg_med is not None else "ear_shoulder_deg: --"
+            total_sec = int(focus_seconds)
+            mm = total_sec // 60
+            ss = total_sec % 60
+            txt_focus = f"Focus: {mm}:{ss:02d}"
 
-            total_sec = int(session_seconds)
-            mm_sess = total_sec // 60
-            ss_sess = total_sec % 60
-            txt_session = f"Session: {mm_sess}:{ss_sess:02d}"
+            for i, text in enumerate([txt_present, txt_neck, txt_ear, txt_focus]):
+                cv2.putText(frame, text, (10, y0 + i * dy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
-            foc_sec = int(focused_seconds)
-            mm_foc = foc_sec // 60
-            ss_foc = foc_sec % 60
-            txt_focus = f"Focused: {mm_foc}:{ss_foc:02d}"
+            # Status pill (top-right)
+            draw_status_pill(frame, state, color)
 
-            for i, text in enumerate(
-                [txt_present, txt_neck, txt_ear, txt_sh, txt_session, txt_focus]
-            ):
-                cv2.putText(
-                    frame,
-                    text,
-                    (10, y0 + i * dy),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
+            # Show frame
+            cv2.imshow("Posture UI + Focus Timer", frame)
 
-            # status pill
-            pill_state = smooth_state
-            pill_conf = smooth_conf if smooth_conf > 0.0 else raw_conf
-            pill_label = f"{pill_state} · {pill_conf:.2f}" if pill_state != "away" else "away"
-            draw_status_pill(frame, pill_label, state_color(pill_state))
+            # Calibration (optional): press 'c' to capture 3s of medians while present and adjust neutral thresholds
+            # We accumulate only while present; then set NEUTRAL_* based on captured medians and flash a message.
 
-            # calibration
+            # Show calibration status/message overlays if active
+            # (draw after main overlays)
+            # Setup mutable state containers on first loop iteration
+            if 'calibrating' not in locals():
+                calibrating = False
+                calib_present_elapsed = 0.0
+                calib_neck_vals: Deque[float] = deque()
+                calib_ear_vals: Deque[float] = deque()
+                calibrate_msg_until = 0.0
+                calibrate_msg_text = ""
+
+            # Update calibration capture
             if calibrating:
                 if present and neck_deg_med is not None:
                     calib_neck_vals.append(float(neck_deg_med))
@@ -361,56 +328,48 @@ def main() -> int:
                     calib_ear_vals.append(float(ear_deg_med))
                 if present:
                     calib_present_elapsed += dt
-                cv2.putText(
-                    frame,
-                    "Calibrating...",
-                    (10, y0 + 6 * dy),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+                cv2.putText(frame, "Calibrating...", (10, y0 + 4 * dy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+
                 if calib_present_elapsed >= 3.0:
-                    neck_cal_med = float(np.median(list(calib_neck_vals))) if calib_neck_vals else None
-                    ear_cal_med = float(np.median(list(calib_ear_vals))) if calib_ear_vals else None
-                    calibrate_msg_text = "Calibration complete"
+                    # Compute medians from captured values (if any)
+                    neck_cal_med = float(np.median(list(calib_neck_vals))) if len(calib_neck_vals) > 0 else None
+                    ear_cal_med = float(np.median(list(calib_ear_vals))) if len(calib_ear_vals) > 0 else None
+
+                    # Update thresholds (use globals)
+                    global NEUTRAL_NECK_MAX, NEUTRAL_EARSHOULDER_MAX
+                    if neck_cal_med is not None:
+                        NEUTRAL_NECK_MAX = max(8.0, neck_cal_med + 4.0)
+                    if ear_cal_med is not None:
+                        NEUTRAL_EARSHOULDER_MAX = max(12.0, ear_cal_med + 6.0)
+
+                    calibrate_msg_text = f"Calibrated: neck<={NEUTRAL_NECK_MAX:.1f}°, ear<={NEUTRAL_EARSHOULDER_MAX:.1f}°"
                     calibrate_msg_until = time.time() + 2.0
                     calibrating = False
                     calib_present_elapsed = 0.0
                     calib_neck_vals.clear()
                     calib_ear_vals.clear()
 
+            # Flash post-calibration message
             if time.time() < calibrate_msg_until and calibrate_msg_text:
-                cv2.putText(
-                    frame,
-                    calibrate_msg_text,
-                    (10, y0 + 7 * dy),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    COLOR_WHITE,
-                    2,
-                    cv2.LINE_AA,
-                )
+                cv2.putText(frame, calibrate_msg_text, (10, y0 + 5 * dy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLOR_WHITE, 2, cv2.LINE_AA)
 
-            cv2.imshow("Posture Model + Focus Timer", frame)
-
+            # Keys
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                print("Quitting...")
+            if key == ord('q'):
+                print("\nQuitting...")
                 break
-            elif key == ord("r"):
-                focused_seconds = 0.0
-                print("Focused timer reset")
-            elif key == ord("c") and not calibrating:
+            elif key == ord('r'):
+                focus_seconds = 0.0
+                print("Focus timer reset")
+            elif key == ord('c') and not calibrating:
                 calibrating = True
                 calib_present_elapsed = 0.0
                 calib_neck_vals.clear()
                 calib_ear_vals.clear()
-                print("Calibration started (~3s while present)")
+                print("Calibration started: need ~3s while present")
 
     except KeyboardInterrupt:
-        print("Interrupted by user")
+        print("\nInterrupted by user")
     finally:
         cap.release()
         cv2.destroyAllWindows()
@@ -419,8 +378,11 @@ def main() -> int:
         except Exception:
             pass
         print("Webcam released and windows closed")
+
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
