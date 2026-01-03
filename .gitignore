@@ -1,3 +1,8 @@
+# Node
+node_modules/
+dist/
+.cache/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -52,12 +57,11 @@ htmlcov/
 *.pth
 *.onnx
 *.pb
-data/
 datasets/
-models/
-*.csv
-*.json
-!package*.json
+
+# Keep trained models but ignore large data files
+data/*.csv
+!backend/models/
 
 # Logs
 *.log
